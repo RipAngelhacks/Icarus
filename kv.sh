@@ -1,8 +1,5 @@
 #!/bin/sh -u
-# Copyright (c) 2010 The Chromium OS Authors. All rights reserved.
-# Use of this source code is governed by a BSD-style license that can be
-# found in the LICENSE file.
-#
+# Copyright (c) 2010 The Chromium OS Authors.
 # lobotomized version of chromeos-tpm-recovery, only resets kernel space
 
 tpmc=tpmc
@@ -14,8 +11,7 @@ err=0
 secdata_kernel=0x1008
 
 tpm2_target() {
-  # This is not an ideal way to tell if we are running on a tpm2 target, but
-  # it will have to do for now.
+  # crude detection
   if [ -f "/etc/init/trunksd.conf" ]; then
     return 0
   else
@@ -24,82 +20,73 @@ tpm2_target() {
 }
 
 use_v0_secdata_kernel() {
-  local fwid=$(crossystem ro_fwid)
-  local major=$(printf "$fwid" | cut -d. -f2)
-  local minor=$(printf "$fwid" | cut -d. -f3)
+  # More robust FWID parsing; avoid arithmetic on empty/non-numeric
+  local fwid
+  fwid="$($crossystem ro_fwid 2>/dev/null || echo "")"
 
-  # TPM1 firmware never supports the v1 kernel space format.
+  # TPM1 always uses v0
   if ! tpm2_target; then
     return 0
   fi
 
-  # First some validity checks: X -eq X checks that X is a number. cut may
-  # return the whole string if no delimiter found, so major != minor checks that
-  # the version was at least somewhat correctly formatted.
-  if [ $major -eq $major ] && [ $minor -eq $minor ] && [ $major -ne $minor ]; then
-    # Now what we really care about: is this firmware older than CL:2041695?
-    if [ $major -lt 12953 ]; then
-      return 0
-    else
+  # Expect something like Google_Rammus.12953.145.0
+  # Extract fields 2 and 3 (major/minor) only if they are numbers.
+  local major minor
+  major=$(printf "%s" "$fwid" | cut -d. -f2)
+  minor=$(printf "%s" "$fwid" | cut -d. -f3)
+
+  case "$major:$minor" in
+    ''|*[^0-9]*:*|*:*[^0-9]*)
+      log "Cannot parse FWID '$fwid'. Assuming v1 kernel space support."
       return 1
-    fi
+      ;;
+  esac
+
+  # Older than CL:2041695 => use v0
+  if [ "$major" -lt 12953 ]; then
+    return 0
   else
-    log "Cannot parse FWID. Assuming local build that supports v1 kernel space."
     return 1
   fi
 }
 
-log() {
-  echo "$*"
-}
+log() { echo "$*"; }
 
 quit() {
   log "ERROR: $*"
   restart_daemon_if_needed
   log "exiting"
-
   exit 1
 }
 
-log_tryfix() {
-  log "$*: attempting to fix"
-}
+log_tryfix() { log "$*: attempting to fix"; }
+log_error() { err=$((err + 1)); log "ERROR: $*"; }
+log_warn()  { log "WARNING: $*"; }
 
-log_error() {
-  err=$((err + 1))
-  log "ERROR: $*"
-}
-
-
-log_warn() {
-  log "WARNING: $*"
-}
-
-write_space () {
-  # do not quote "$2", as we mean to expand it here
-  if ! $tpmc write $1 $2; then
+write_space() {
+  # do not quote "$2" as we intend word expansion to send bytes
+  if ! $tpmc write "$1" $2; then
     log_error "writing to $1 failed"
   else
     log "$1 written successfully"
   fi
 }
 
-reset_rw_space () {
-  local index=$1
+reset_rw_space() {
+  local index="$1"
   local bytes="$2"
-  local size=$(printf "$bytes" | wc -w)
+  local size
+  size=$(printf "%s" "$bytes" | wc -w)
   local permissions=0x1
-
   if tpm2_target; then
     permissions=0x40050001
   fi
 
-  if ! $tpmc definespace $index $size $permissions; then
+  if ! $tpmc definespace "$index" "$size" "$permissions"; then
     log_error "could not redefine RW space $index"
-    # try writing it anyway, just in case it works...
+    # try writing anyway
   fi
-
-  write_space $index "$bytes"
+  write_space "$index" "$bytes"
 }
 
 restart_daemon_if_needed() {
@@ -112,14 +99,11 @@ restart_daemon_if_needed() {
 # ------------
 # MAIN PROGRAM
 # ------------
-
 if tpm2_target; then
   DAEMON="trunksd"
 else
   DAEMON="tcsd"
 fi
-
-# TPM daemon may or may not be running
 
 log "Stopping ${DAEMON}..."
 if $initctl stop "${DAEMON}" >/dev/null 2>/dev/null; then
@@ -130,12 +114,22 @@ else
   log "(was not running)"
 fi
 
-# Is the state of the PP enable flags correct?
-
 if ! tpm2_target; then
-  if ! ($tpmc getpf | grep -q "physicalPresenceLifetimeLock 1" &&
-      $tpmc getpf | grep -q "physicalPresenceHWEnable 0" &&
-      $tpmc getpf | grep -q "physicalPresenceCMDEnable 1"); then
+  # TPM 1.2: FIRST ensure physical presence ON
+  if $tpmc getvf | grep -q "physicalPresence 0"; then
+    log_tryfix "physical presence is OFF, expected ON"
+    if $tpmc ppon; then
+      log "physical presence is now on"
+    else
+      quit "could not turn physical presence on"
+    fi
+  fi
+
+  # THEN fix PP enable flags
+  pf="$($tpmc getpf)"
+  if ! ( echo "$pf" | grep -q "physicalPresenceLifetimeLock 1" \
+         && echo "$pf" | grep -q "physicalPresenceHWEnable 0" \
+         && echo "$pf" | grep -q "physicalPresenceCMDEnable 1" ); then
     log_tryfix "bad state of physical presence enable flags"
     if $tpmc ppfin; then
       log "physical presence enable flags are now correctly set"
@@ -143,28 +137,17 @@ if ! tpm2_target; then
       quit "could not set physical presence enable flags"
     fi
   fi
-
-  # Is physical presence turned on?
-
-  if $tpmc getvf | grep -q "physicalPresence 0"; then
-    log_tryfix "physical presence is OFF, expected ON"
-    # attempt to turn on physical presence
-    if $tpmc ppon; then
-      log "physical presence is now on"
-    else
-      quit "could not turn physical presence on"
-    fi
-  fi
 else
+  # TPM 2.0: ensure Platform Hierarchy is enabled
   if ! $tpmc getvf | grep -q 'phEnable 1'; then
     quit "Platform Hierarchy is disabled, TPM can't be recovered"
   fi
 fi
 
 if use_v0_secdata_kernel; then
-  reset_rw_space $secdata_kernel "02  4c 57 52 47  1 0 1 0  0 0 0  55"
+  reset_rw_space $secdata_kernel "02 4c 57 52 47 1 0 1 0 0 0 0 55"
 else
-  reset_rw_space $secdata_kernel "10  28  0c  0  1 0 1 0  0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
+  reset_rw_space $secdata_kernel "10 28 0c 0 1 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
 fi
 
 restart_daemon_if_needed
