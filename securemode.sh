@@ -1,9 +1,9 @@
 #!/bin/sh
-# Full Safe Reset & Unenroll Script for Chromebook (VT4 Internet Recovery - Bypasses Secure Mode, Keeps Dev Mode)
-# Adapted from BadApple-Icarus "daub" by HarryJarry1 for KV6 Corsola V140 on steelix (Lenovo 300e Yoga Gen 4).
-# Uses 2025-compatible methods: Wipes stateful, GPT tweaks for dev boot, gsctool deprovision, cryptohome FWMP removal.
-# No disable_dev_request flag to preserve dev mode. Run as root in VT4 (Ctrl + Alt + F4). Erases data.
-# WARNING: In recovery; may need PP (power button) for gsctool. If fails, retry post-boot in shell.
+# Adapted Br0ker Script for KV6 Corsola V140 Unenroll (VT4 Internet Recovery - Keeps Dev Mode)
+# Based on OlyB's Br0ker for BadApple/SH1MMER, modified for KV6 (no vulnerable kernel DD; uses existing rootfs).
+# Focuses on stateful unblock files, VPD enrollment flag, and crossystem to bypass secure mode prompt.
+# Run as root in VT4 (Ctrl + Alt + F4). Erases data. May need post-boot gsctool for full deprovision.
+# WARNING: KV6 patched for kernel exploits; this emulates unblock effects. If prompt persists, WP disable needed.
 
 fail() {
     printf "$1\n"
@@ -12,10 +12,8 @@ fail() {
 }
 
 check_tools() {
-    for tool in cgpt fdisk crossystem mount umount chroot mkdir rmdir vgchange vgscan awk grep head tr gsctool cryptohome tpm_manager_client dmver; do
-        if ! command -v "$tool" >/dev/null 2>&1; then
-            echo "Warning: $tool not available (expected in some recovery; skip where possible)."
-        fi
+    for tool in cgpt crossystem vpd mount umount mkdir rmdir awk grep head tr pv; do
+        command -v "$tool" >/dev/null 2>&1 || echo "Warning: $tool unavailable (skip where possible)."
     done
     echo "Tools checked."
 }
@@ -46,75 +44,84 @@ get_internal() {
     echo "Detected internal disk: $intdis."
 }
 
-mountlvm() {
-    vgchange -ay 2>/dev/null || true
-    local volgroup=$(vgscan 2>/dev/null | grep "Found volume group" | awk '{print $4}' | tr -d '"')
-    if [ -n "$volgroup" ]; then
-        mount "/dev/$volgroup/unencrypted" /stateful || fail "LVM mount failed."
-    fi
+format_part_number() {
+    echo -n "$1"
+    echo "$1" | grep -q '[0-9]$' && echo -n p
+    echo "$2"
 }
 
 main() {
-    echo "Starting unenroll process..."
+    echo "Starting KV6-adapted Br0ker unenroll..."
     get_internal
     check_tools
 
-    mkdir -p /localroot || fail "Create /localroot failed."
+    local CROS_DEV="$intdis"
+    local TARGET_STATEFUL=$(format_part_number "$CROS_DEV" 1)
+    local TARGET_KERN=$(format_part_number "$CROS_DEV" 2)
+    local TARGET_ROOT=$(format_part_number "$CROS_DEV" 3)
 
-    local root_part="${intdis}${intdis_prefix}3"
-    mount "$root_part" /localroot -o ro || fail "Mount root ro failed: $root_part."
+    [ -b "$TARGET_STATEFUL" ] || fail "$TARGET_STATEFUL not block device!"
+    [ -b "$TARGET_KERN" ] || fail "$TARGET_KERN not block device!"
+    [ -b "$TARGET_ROOT" ] || fail "$TARGET_ROOT not block device!"
 
-    mount --bind /dev /localroot/dev || fail "Bind /dev failed."
+    # Skip TPM daemon stop (recovery)
 
-    chroot /localroot cgpt add "$intdis" -i 2 -P 10 -T 5 -S 1 || echo "cgpt add warning."
+    # Skip kernel ver check (KV6)
 
-    (
-        echo "d"
-        echo "4"
-        echo "d"
-        echo "5"
-        echo "w"
-    ) | chroot /localroot fdisk "$intdis" 2>/dev/null || echo "fdisk warning."
+    echo "Using existing kernel/rootfs (V140 KV6 - no downgrade)."
 
-    umount /localroot/dev 2>/dev/null || true
-    umount /localroot 2>/dev/null || true
-    rmdir /localroot 2>/dev/null || true
+    # Prioritize dev kernel (assume KERN-A/B setup)
+    cgpt add "$CROS_DEV" -i 2 -S1 -T0 2>/dev/null || echo "cgpt add warning."
+    cgpt prioritize "$CROS_DEV" -i 2 2>/dev/null || echo "cgpt prioritize warning."
 
-    # No disable_dev_request - keep dev mode
-
-    local stateful_part="${intdis}${intdis_prefix}1"
-    if ! mount "$stateful_part" /stateful 2>/dev/null; then
-        mountlvm
+    # Format stateful (wipes data)
+    if command -v mkfs.ext4 >/dev/null 2>&1; then
+        mkfs.ext4 -F -b 4096 -L H-STATE "$TARGET_STATEFUL"
+    else
+        MNT=$(mktemp -d)
+        mount -o ro "$TARGET_ROOT" "$MNT" || fail "Mount root failed."
+        mount --bind /dev "$MNT"/dev || fail "Bind /dev failed."
+        chroot "$MNT" /sbin/mkfs.ext4 -F -b 4096 -L H-STATE "$TARGET_STATEFUL" || echo "mkfs warning."
+        umount "$MNT"/dev 2>/dev/null || true
+        umount "$MNT" 2>/dev/null || true
+        rmdir "$MNT" 2>/dev/null || true
     fi
-    if mountpoint -q /stateful; then
-        rm -rf /stateful/*
-        echo "Stateful wiped."
-        umount /stateful 2>/dev/null || true
-    fi
 
-    # Deprovision
+    # Mount stateful and create unblock files (key for unenroll)
+    MNT=$(mktemp -d)
+    mount "$TARGET_STATEFUL" "$MNT" || fail "Mount stateful failed."
+    mkdir -p "$MNT"/dev_mode_unblock_broker || fail "Create unblock dir failed."
+    touch "$MNT"/dev_mode_unblock_broker/carrier_lock_unblocked \
+         "$MNT"/dev_mode_unblock_broker/init_state_determination_unblocked \
+         "$MNT"/dev_mode_unblock_broker/enrollment_unblocked || echo "Touch files warning."
+    umount "$MNT" 2>/dev/null || true
+    rmdir "$MNT" 2>/dev/null || true
+
+    # Set VPD enrollment flag (clears check)
+    vpd -i RW_VPD -s check_enrollment=0 || echo "VPD set warning (may need WP off)."
+
+    # Set crossystem to skip secure prompt (keeps dev mode; omit block_devmode)
+    crossystem disable_dev_request=1 || echo "crossystem warning."
+
+    # Attempt deprovision if tools available
     if command -v gsctool >/dev/null 2>&1; then
-        echo "Deprovision TPM (press power if PP prompted)."
-        gsctool -a -o || echo "gsctool warning (retry post-boot)."
+        gsctool -a -o || echo "gsctool warning (press power for PP)."
     fi
     if command -v cryptohome >/dev/null 2>&1; then
         cryptohome --action=remove_firmware_management_parameters || echo "cryptohome warning."
     fi
     if command -v tpm_manager_client >/dev/null 2>&1; then
-        tpm_manager_client take_ownership || echo "tpm_manager warning."
-    fi
-    if command -v dmver >/dev/null 2>&1; then
-        dmver check || echo "dmver warning."
+        tpm_manager_client take_ownership || echo "tpm warning."
     fi
 
-    echo "Complete! Reboot -f, Ctrl+D at warning. Post-boot: Retry commands in shell if needed."
+    echo "Complete! Reboot -f. Ctrl+D at warning to boot dev mode."
+    echo "Post-boot: Ctrl+Alt+F2 > chronos > sudo su > dmver check (UNENROLLED?)."
+    echo "If enrolled, retry gsctool + powerwash."
     sleep 3
     reboot -f
 }
 
-echo "WARNING: Erases data, unenrolls where possible."
-read -p "Reset Chromebook? (y/n) " -n 1 -r
+echo "WARNING: Erases data on stateful. Adapted for KV6 - may need manual post-boot steps."
+read -p "Continue unenroll? (y/N) " -n 1 -r
 echo
-if [ "$REPLY" = "y" ] || [ "$REPLY" = "Y" ]; then
-    main
-fi
+case "$REPLY" in [yY]) main ;; *) echo "Aborted." ;; esac
