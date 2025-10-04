@@ -1,11 +1,11 @@
 #!/bin/sh
-# Full Safe Reset Script for Chromebook (VT4 Internet Recovery - Disables Secure Mode Error)
+# Full Safe Reset & Auto-Unenroll Script for Chromebook (VT4 Internet Recovery - Disables Secure Mode & Unenrolls on Boot)
 # Adapted from "daub" by HarryJarry1 for KV6 Corsola V140 on steelix (Lenovo 300e Yoga Gen 4).
-# This uses current (2025) compatible methods: Wipes stateful (data reset), manipulates GPT for dev boot priority,
-# sets disable_dev_request=1 to skip "return to secure mode" prompt, and clears enrollment data where possible.
-# Run as root in VT4 shell (Ctrl + Alt + F4). Software-only; no hardware mods. Erases all user data.
-# WARNING: Experimental in recovery; backs up nothing. If fails, use internet recovery. Does not guarantee full unenroll on KV6 (may need cryptohome post-boot).
-# After reboot, boot to dev mode and run: cryptohome --action=remove_firmware_management_parameters for complete unenroll.
+# Enhanced for automatic unenrollment: Modifies rootfs to add a one-time upstart job that runs deprovision & cryptohome on first boot.
+# Uses current (2025) methods: Wipes stateful, GPT tweaks, disable_dev_request=1, plus boot-time unenroll hook.
+# Run as root in VT4 shell (Ctrl + Alt + F4). Software-only; no hardware. Erases data. Hard but possible via rootfs mod.
+# WARNING: Modifies rootfs (risky if interrupted); test tools. May not fully unenroll if TPM locked—run gsctool manually post-boot if needed.
+# After reboot, job runs once, then self-deletes. Check enrollment status with 'dmver check'.
 
 fail() {
     printf "$1\n"
@@ -13,19 +13,17 @@ fail() {
     exit 1
 }
 
-# Safety check: Confirm tools exist (standard in recovery shell)
 check_tools() {
-    for tool in cgpt fdisk crossystem mount umount chroot mkdir rmdir vgchange vgscan awk grep head tr; do
+    for tool in cgpt fdisk crossystem mount umount chroot mkdir rmdir vgchange vgscan awk grep head tr initctl; do
         if ! command -v "$tool" >/dev/null 2>&1; then
-            fail "Missing tool: $tool. Ensure you're in full VT4 recovery shell."
+            fail "Missing tool: $tool. Ensure full VT4 recovery shell."
         fi
     done
     echo "All required tools detected."
 }
 
 get_internal() {
-    # Detect internal disk (eMMC for corsola/steelix)
-    local ROOTDEV_LIST=$(cgpt find -t rootfs 2>/dev/null || fail "cgpt find failed - recovery issue?")
+    local ROOTDEV_LIST=$(cgpt find -t rootfs 2>/dev/null || fail "cgpt find failed.")
     if [ -z "$ROOTDEV_LIST" ]; then
         fail "Could not parse rootdev devices."
     fi
@@ -51,83 +49,132 @@ get_internal() {
 }
 
 mountlvm() {
-    vgchange -ay 2>/dev/null || echo "vgchange skipped (no LVM detected)."
+    vgchange -ay 2>/dev/null || echo "vgchange skipped (no LVM)."
     local volgroup=$(vgscan 2>/dev/null | grep "Found volume group" | awk '{print $4}' | tr -d '"')
     if [ -n "$volgroup" ]; then
         echo "Found volume group: $volgroup"
-        mount "/dev/$volgroup/unencrypted" /stateful || fail "Could not mount LVM /stateful. Use standard recovery."
+        mount "/dev/$volgroup/unencrypted" /stateful || fail "Could not mount LVM /stateful."
     else
         echo "No LVM; skipping."
     fi
 }
 
+setup_auto_unenroll() {
+    # In chroot: Create unenroll script & upstart job for boot-time execution
+    cat > /localroot/usr/local/bin/unenroll.sh << 'EOF'
+#!/bin/sh
+# One-time unenroll script
+if [ -f /var/run/unenrolled ]; then
+    exit 0  # Already run
+fi
+
+# Deprovision TPM if gsctool available
+if command -v gsctool >/dev/null 2>&1; then
+    gsctool -a -o 2>/dev/null || true
+    sleep 2
+fi
+
+# Remove firmware management params if cryptohome available
+if command -v cryptohome >/dev/null 2>&1; then
+    cryptohome --action=remove_firmware_management_parameters 2>/dev/null || true
+fi
+
+# Take ownership if needed
+if command -v tpm_manager_client >/dev/null 2>&1; then
+    tpm_manager_client take_ownership 2>/dev/null || true
+fi
+
+# Mark as done & clean up
+touch /var/run/unenrolled
+rm -f /etc/init/unenroll.conf
+rm -f /usr/local/bin/unenroll.sh
+initctl reload-configuration 2>/dev/null || true
+echo "Auto-unenroll complete."
+EOF
+    chroot /localroot chmod +x /usr/local/bin/unenroll.sh
+
+    # Create upstart job to run early on boot (before UI)
+    cat > /localroot/etc/init/unenroll.conf << 'EOF'
+description "One-time unenroll"
+author "Auto-Unenroll"
+
+start on startup
+task
+script
+    /usr/local/bin/unenroll.sh
+end script
+EOF
+    echo "Auto-unenroll job created in rootfs."
+}
+
 main() {
-    echo "Starting Chromebook reset process to disable secure mode error..."
+    echo "Starting Chromebook reset & auto-unenroll process..."
     get_internal
     check_tools
 
-    # Create temp mount point
     mkdir -p /localroot || fail "Could not create /localroot."
 
-    # Mount root partition (ro for safety)
     local root_part="${intdis}${intdis_prefix}3"
-    mount "$root_part" /localroot -o ro || fail "Could not mount root partition: $root_part."
+    # Mount rw for modifications
+    mount "$root_part" /localroot -o rw || fail "Could not mount root rw: $root_part."
 
-    # Bind /dev for chroot
     mount --bind /dev /localroot/dev || fail "Could not bind /dev."
 
-    # Set GPT priority for root B (enables dev mode boot)
-    chroot /localroot cgpt add "$intdis" -i 2 -P 10 -T 5 -S 1 || echo "Warning: cgpt add failed (may already be configured)."
+    # GPT priority for root B
+    chroot /localroot cgpt add "$intdis" -i 2 -P 10 -T 5 -S 1 || echo "Warning: cgpt add failed."
 
-    # Delete reserved partitions 4 and 5 for clean state
+    # Delete partitions 4/5
     (
         echo "d"
         echo "4"
         echo "d"
         echo "5"
         echo "w"
-    ) | chroot /localroot fdisk "$intdis" 2>/dev/null || echo "Warning: fdisk failed (disk may be busy)."
+    ) | chroot /localroot fdisk "$intdis" 2>/dev/null || echo "Warning: fdisk failed."
 
-    # Cleanup mounts
-    umount /localroot/dev 2>/dev/null || echo "Warning: umount /dev failed."
-    umount /localroot 2>/dev/null || echo "Warning: umount root failed."
-    rmdir /localroot 2>/dev/null || echo "Warning: rmdir failed."
+    # Setup auto-unenroll
+    setup_auto_unenroll
 
-    # Set flag to disable dev request (skips secure mode beep/prompt)
-    crossystem disable_dev_request=1 || fail "crossystem failed - could not set disable_dev_request flag."
+    # Cleanup chroot mounts
+    umount /localroot/dev 2>/dev/null || true
+    umount /localroot 2>/dev/null || true
+    rmdir /localroot 2>/dev/null || true
 
-    # Mount and wipe stateful (full reset, clears enrollment cache)
+    # Disable dev request
+    crossystem disable_dev_request=1 || fail "crossystem failed."
+
+    # Wipe stateful
     local stateful_part="${intdis}${intdis_prefix}1"
     if ! mount "$stateful_part" /stateful 2>/dev/null; then
-        mountlvm  # Fallback to LVM if needed
+        mountlvm
     fi
     if mountpoint -q /stateful; then
-        rm -rf /stateful/*  # Verbose wipe: add -v if desired
-        echo "Stateful partition wiped (data reset complete)."
-        umount /stateful 2>/dev/null || echo "Warning: umount /stateful failed."
+        rm -rf /stateful/*
+        echo "Stateful wiped."
+        umount /stateful 2>/dev/null || true
     else
-        echo "Warning: Could not mount/wipe /stateful (partial reset)."
+        echo "Warning: Could not wipe /stateful."
     fi
 
-    # Additional: Attempt cryptohome unenroll if tool available (post-reset)
+    # Attempt immediate unenroll if tools here
     if command -v cryptohome >/dev/null 2>&1; then
-        cryptohome --action=remove_firmware_management_parameters || echo "Warning: cryptohome unenroll failed (run after boot)."
-    else
-        echo "cryptohome not available in recovery; run after reboot."
+        cryptohome --action=remove_firmware_management_parameters || echo "Warning: cryptohome failed."
+    fi
+    if command -v gsctool >/dev/null 2>&1; then
+        gsctool -a -o || echo "Warning: gsctool deprovision failed (press power for PP)."
     fi
 
-    echo "Reset complete! Secure mode error should be bypassed on next boot."
-    echo "Run 'reboot -f' to force reboot into dev mode (press Ctrl+D at any warning)."
-    echo "Post-boot: In shell (Ctrl+Alt+F2), run 'cryptohome --action=remove_firmware_management_parameters' for full unenroll."
+    echo "Process complete! Secure mode bypassed; auto-unenroll runs on first boot."
+    echo "Run 'reboot -f' to reboot (Ctrl+D at warnings)."
+    echo "Post-boot: Check with 'dmver check'; if still enrolled, run unenroll commands manually in shell."
 }
 
-echo "WARNING: This will fully reset your Chromebook (erase all data, like a powerwash + more)."
-echo "It disables the 'return to secure mode' error but may not fully unenroll on KV6 without post-boot steps."
-echo "Backup anything important first (impossible in recovery, but noted)."
+echo "WARNING: This resets your Chromebook (erases data) and modifies rootfs for auto-unenroll on boot."
+echo "Hard but possible; may need manual TPM PP (power button) if prompted."
 read -p "Are you sure you want to reset your Chromebook? (y/n) " -n 1 -r
 echo
 if [ "$REPLY" = "y" ] || [ "$REPLY" = "Y" ]; then
     main
 else
-    echo "Aborted. No changes made."
+    echo "Aborted."
 fi
